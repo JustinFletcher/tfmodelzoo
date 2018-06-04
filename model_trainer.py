@@ -5,7 +5,90 @@ import functools
 import tensorflow as tf
 
 import model_zoo as zoo
+from loss import CrossEntropyLoss
+from optimizer import OptimizerBuilder
 from data_provider import DataProvider
+# import tf_data_zoo
+
+from io import StringIO
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+class Logger(object):
+    """Logging in tensorboard without tensorflow ops."""
+
+    def __init__(self, log_dir):
+        """Creates a summary writer logging to log_dir."""
+        self.writer = tf.summary.FileWriter(log_dir)
+
+    def log_scalar(self, tag, value, step):
+        """Log a scalar variable.
+        Parameter
+        ----------
+        tag : basestring
+            Name of the scalar
+        value
+        step : int
+            training iteration
+        """
+        summary = tf.Summary(value=[tf.Summary.Value(tag=tag,
+                                                     simple_value=value)])
+        self.writer.add_summary(summary, step)
+
+    def log_images(self, tag, images, step):
+        """Logs a list of images."""
+
+        im_summaries = []
+        for nr, img in enumerate(images):
+            # Write the image to a string
+            s = StringIO()
+            plt.imsave(s, img, format='png')
+
+            # Create an Image object
+            img_sum = tf.Summary.Image(encoded_image_string=s.getvalue(),
+                                       height=img.shape[0],
+                                       width=img.shape[1])
+            # Create a Summary value
+            im_summaries.append(tf.Summary.Value(tag='%s/%d' % (tag, nr),
+                                                 image=img_sum))
+
+        # Create and write Summary
+        summary = tf.Summary(value=im_summaries)
+        self.writer.add_summary(summary, step)
+
+
+    def log_histogram(self, tag, values, step, bins=1000):
+        """Logs the histogram of a list/vector of values."""
+        # Convert to a numpy array
+        values = np.array(values)
+
+        # Create histogram using numpy
+        counts, bin_edges = np.histogram(values, bins=bins)
+
+        # Fill fields of histogram proto
+        hist = tf.HistogramProto()
+        hist.min = float(np.min(values))
+        hist.max = float(np.max(values))
+        hist.num = int(np.prod(values.shape))
+        hist.sum = float(np.sum(values))
+        hist.sum_squares = float(np.sum(values**2))
+
+        # Requires equal number as bins, where the first goes from -DBL_MAX to bin_edges[1]
+        # See https://github.com/tensorflow/tensorflow/blob/master/tensorflow/core/framework/summary.proto#L30
+        # Thus, we drop the start of the first bin
+        bin_edges = bin_edges[1:]
+
+        # Add bin edges and counts
+        for edge in bin_edges:
+            hist.bucket_limit.append(edge)
+        for c in counts:
+            hist.bucket.append(c)
+
+        # Create and write Summary
+        summary = tf.Summary(value=[tf.Summary.Value(tag=tag, histo=hist)])
+        self.writer.add_summary(summary, step)
+        self.writer.flush()
 
 
 def doublewrap(function):
@@ -57,18 +140,21 @@ class ModelTrainer(object):
                  model,
                  data,
                  loss,
-                 optimizer):
-
-        # Internalize instantiation parameters
+                 optimizer,
+                 log_dir):
 
         self.model = model
+
         self.data = data
 
-        # Register instance methods, building the computational graph.
-        # self.optimizer = optimizer
-
         self.loss = loss.add_loss_to_graph(self.model)
+
         self.optimizer = optimizer.add_optimizer_to_graph(self.loss)
+
+        self.error
+
+        # Merge the summary.
+        # tf.summary.merge_all()
 
     @define_scope
     def error(self):
@@ -76,8 +162,80 @@ class ModelTrainer(object):
         mistakes = tf.not_equal(tf.argmax(self.model.target_placeholder, 1),
                                 tf.argmax(self.model.inference, 1))
         error = tf.reduce_mean(tf.cast(mistakes, tf.float32))
-        # tf.summary.scalar('error', error)
+        tf.summary.scalar('error', error)
         return(error)
+
+    # @define_scope
+    def train_epoch(self):
+
+        print("------------training_epoch-------------")
+
+        # Initialize the training dataset.
+        self.data.initialize_training_iterator(self.sess)
+
+        # Run one training epoch.
+        while True:
+
+            try:
+
+                images, labels = self.data.get_next_training_element(self.sess)
+
+                # Make a dict to load the batch onto the placeholders.
+                feed_dict = {self.stimulus_placeholder: images,
+                             self.target_placeholder: labels,
+                             self.keep_prob: FLAGS.keep_prob}
+
+                # Compute error over the training set.
+                # train_error = sess.run(model_trainer.error,
+                #                        feed_dict=train_dict)
+
+                # Compute loss over the training set.
+                train_loss = self.sess.run(self.loss, feed_dict=feed_dict)
+
+                # print("train loss = %f" % train_loss)
+
+                self.sess.run(self.optimizer, feed_dict=feed_dict)
+
+            except tf.errors.OutOfRangeError:
+
+                break
+
+        # print("Training Epoch " + str(i) + " complete.")
+        print(train_loss)
+
+        # Initialize the validation dataset.
+        self.data.initialize_validation_iterator(self.sess)
+
+        # Run one validation epoch.
+        while True:
+
+            try:
+
+                images, labels = self.data.get_next_validation_element(
+                    self.sess)
+
+                # Make a dict to load the batch onto the placeholders.
+                feed_dict = {self.model.stimulus_placeholder: images,
+                             self.model.target_placeholder: labels,
+                             self.model.keep_prob: FLAGS.keep_prob}
+
+                # Compute error over the training set.
+                # train_error = sess.run(model_trainer.error,
+                #                        feed_dict=train_dict)
+
+                # Compute loss over the training set.
+                validation_loss = self.sess.run(self.loss, feed_dict=feed_dict)
+
+                # print("validation_loss = %f" % validation_loss)
+
+            except tf.errors.OutOfRangeError:
+
+                break
+
+        # print("Validation Epoch " + str(i) + " complete.")
+        print(validation_loss)
+
+        print("----------------------------------------")
 
 
 def example_usage(_):
@@ -92,9 +250,11 @@ def example_usage(_):
     # Reset the default graph.
     tf.reset_default_graph()
 
+    # tf.train.create_global_step()
+
     print("------------model_output-------------")
 
-    # Get a model.
+    # Instantiate the model zoo and retrieve a model.
     model_zoo = zoo.TensorFlowModelZoo()
 
     model = model_zoo.get_model('lenet')
@@ -108,58 +268,46 @@ def example_usage(_):
                                  validation_filenames=validation_filenames,
                                  batch_size=batch_size)
 
-    class Loss(object):
+    logger = Logger(FLAGS.log_dir)
 
-        def add_loss_to_graph(self, model):
+    # data_zoo = tf_data_zoo.TensorFlowDataZoo()
 
-            raise NotImplementedError
+    # training_data = data_zoo.get_dataset('mnist',
+    #                                      partition='training',
+    #                                      data_path=training_filenames)
 
-    class CrossEntropyLoss(Loss):
-
-        def add_loss_to_graph(self, model):
-
-            # Get a loss.
-            # Compute the cross entropy.
-            xe = tf.nn.softmax_cross_entropy_with_logits(
-                labels=model.target_placeholder,
-                logits=model.inference,
-                name='xentropy')
-            # Take the mean of the cross entropy.
-            loss = tf.reduce_mean(xe, name='xentropy_mean')
-
-            return(loss)
+    # validation_data = data_zoo.get_dataset('mnist',
+    #                                        partition='validation',
+    #                                        data_path=validation_filenames)
 
     loss = CrossEntropyLoss()
 
-    class OptimizerBuilder(object):
+    # loss_zoo = tf_loss_zoo.TensorFlowLossZoo()
 
-        def __init__(self, learning_rate):
-
-            self.learning_rate = learning_rate
-
-        def add_optimizer_to_graph(self, loss):
-
-            opt = tf.train.AdamOptimizer(self.learning_rate).minimize(loss)
-
-            return(opt)
+    # loss = loss_zoo.get_loss("cross_entropy_loss")
 
     optimizer = OptimizerBuilder(FLAGS.learning_rate)
+
+    # optimizer_zoo = tf_optimizer_zoo.TensorFlowOptimizerZoo()
+
+    # optimizer = optimizer_zoo.get_optimizer("adam")
 
     # Build a model trainer.
     model_trainer = ModelTrainer(model=model,
                                  data=data_provider,
                                  optimizer=optimizer,
-                                 loss=loss)
+                                 loss=loss,
+                                 log_dir=FLAGS.log_dir)
 
     print("-------------------------------------")
+
+    # model_trainer.train_epoch()
 
     # Merge the summary.
     tf.summary.merge_all()
 
     # validation_loss = tf.scalar("validation_loss")
-
-    # Instantiate a session and initialize it.
-    sv = tf.train.Supervisor(logdir=FLAGS.log_dir, save_summaries_secs=10.0)
+    sv = tf.train.Supervisor(logdir=FLAGS.log_dir, save_summaries_secs=20.0)
 
     with sv.managed_session() as sess:
 
@@ -170,16 +318,11 @@ def example_usage(_):
 
         print("------------training_output-------------")
 
-        # Print a line for debug.
-        print('step | train_loss | train_error | val_loss |' +
-              ' val_error | t | total_time')
-
         # Iterate until the epoch limit has been reached.
-        for i in range(FLAGS.max_steps):
+        for i in range(FLAGS.num_epochs):
 
-            # Check for break.
-            if sv.should_stop():
-                break
+            train_loss = 0
+            validation_loss = 0
 
             # Initialize the training dataset.
             data_provider.initialize_training_iterator(sess)
@@ -193,17 +336,17 @@ def example_usage(_):
                         sess)
 
                     # Make a dict to load the batch onto the placeholders.
-                    feed_dict = {model.stimulus_placeholder: images,
-                                 model.target_placeholder: labels,
-                                 model.keep_prob: FLAGS.keep_prob}
+                    feed_dict = {model_trainer.model.stimulus_placeholder: images,
+                                 model_trainer.model.target_placeholder: labels,
+                                 model_trainer.model.keep_prob: FLAGS.keep_prob}
 
                     # Compute error over the training set.
                     # train_error = sess.run(model_trainer.error,
                     #                        feed_dict=train_dict)
 
                     # Compute loss over the training set.
-                    train_loss = sess.run(model_trainer.loss,
-                                          feed_dict=feed_dict)
+                    train_loss += sess.run(model_trainer.loss,
+                                           feed_dict=feed_dict)
 
                     # print("train loss = %f" % train_loss)
 
@@ -217,6 +360,8 @@ def example_usage(_):
             print("Training Epoch " + str(i) + " complete.")
             print(train_loss)
 
+            logger.log_scalar('training_loss', train_loss, i)
+
             # Initialize the validation dataset.
             data_provider.initialize_validation_iterator(sess)
 
@@ -229,17 +374,17 @@ def example_usage(_):
                         sess)
 
                     # Make a dict to load the batch onto the placeholders.
-                    feed_dict = {model.stimulus_placeholder: images,
-                                 model.target_placeholder: labels,
-                                 model.keep_prob: FLAGS.keep_prob}
+                    feed_dict = {model_trainer.model.stimulus_placeholder: images,
+                                 model_trainer.model.target_placeholder: labels,
+                                 model_trainer.model.keep_prob: FLAGS.keep_prob}
 
                     # Compute error over the training set.
                     # train_error = sess.run(model_trainer.error,
                     #                        feed_dict=train_dict)
 
                     # Compute loss over the training set.
-                    validation_loss = sess.run(model_trainer.loss,
-                                               feed_dict=feed_dict)
+                    validation_loss += sess.run(model_trainer.loss,
+                                                feed_dict=feed_dict)
 
                     # print("validation_loss = %f" % validation_loss)
 
@@ -250,52 +395,7 @@ def example_usage(_):
             print("Validation Epoch " + str(i) + " complete.")
             print(validation_loss)
 
-            # start_time = time.time()
-
-            # images, labels = data_provider.get_next_training_element(sess)
-
-            # # Make a dict to load the batch onto the placeholders.
-            # train_dict = {model.stimulus_placeholder: images,
-            #               model.target_placeholder: labels,
-            #               model.keep_prob: FLAGS.keep_prob}
-
-            # # Compute error over the training set.
-            # # train_error = sess.run(model_trainer.error, feed_dict=train_dict)
-
-            # # Compute loss over the training set.
-            # train_loss = sess.run(model_trainer.loss, feed_dict=train_dict)
-
-            # print(train_loss)
-
-            # # Store the data we wish to manually report.
-            # steps.append(i)
-            # train_losses.append(train_loss)
-            # # train_errors.append(train_error)
-            # # val_losses.append(val_loss)
-            # # val_errors.append(val_error)
-
-            # mean_running_time = np.mean(running_times)
-            # mean_running_times.append(mean_running_time)
-
-            # # Print relevant values.
-            # print('%d | %.6f | %.6f | %.2f'
-            #       % (i,
-            #          train_loss,
-            #          np.mean(running_times),
-            #          np.sum(running_times)))
-
-            # # Reset running times measurment
-            # running_times = []
-
-            # # Optimize the model.
-
-            # sess.run(model_trainer.optimizer, feed_dict=train_dict)
-
-            # # train_writer.add_summary(summary, i)
-
-            # # Update timekeeping variables.
-            # running_time = time.time() - start_time
-            # running_times.append(running_time)
+            logger.log_scalar('validation_loss', validation_loss, i)
 
         print("----------------------------------------")
 
@@ -340,8 +440,8 @@ if __name__ == '__main__':
                         default=1,
                         help='Interval between training batch refresh.')
 
-    parser.add_argument('--max_steps', type=int, default=1000,
-                        help='Number of steps to run trainer.')
+    parser.add_argument('--num_epochs', type=int, default=5,
+                        help='Number of epochs to run trainer.')
 
     parser.add_argument('--test_interval', type=int, default=10,
                         help='Number of steps between test set evaluations.')
@@ -373,15 +473,6 @@ if __name__ == '__main__':
     parser.add_argument('--val_batch_size', type=int,
                         default=10000,
                         help='Validation set batch size.')
-
-    # These flags control the input pipeline threading.
-    parser.add_argument('--val_enqueue_threads', type=int,
-                        default=32,
-                        help='Number of threads to enqueue val examples.')
-
-    parser.add_argument('--train_enqueue_threads', type=int,
-                        default=128,
-                        help='Number of threads to enqueue train examples.')
 
     # These flags specify placekeeping variables.
     parser.add_argument('--rep_num', type=int,
